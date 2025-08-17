@@ -1,0 +1,7 @@
+services:
+  budget_bot:
+    build: .
+    container_name: budget_bot_container
+    env_file:
+      - .env
+    restart: unless-stopped

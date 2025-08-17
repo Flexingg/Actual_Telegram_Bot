@@ -1,6 +1,5 @@
 import telegram
 import asyncio
-import pytz
 import re
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -10,7 +9,7 @@ from datetime import date, timedelta, datetime
 import google.generativeai as genai
 from dotenv import load_dotenv
 from actual import Actual
-from actual.queries import get_transactions, get_categories as get_categories_from_actual_queries, get_accounts, reconcile_transaction
+from actual.queries import get_transactions, get_categories as get_categories_from_actual_queries, get_accounts, reconcile_transaction, get_budgets
 from actual.exceptions import UnknownFileId, ActualError
 from rules_manager import RuleSet, Rule, Condition, Action, ConditionType, ActionType, ValueType, load_rules, save_rules
 from sqlalchemy.orm.exc import MultipleResultsFound
@@ -538,41 +537,74 @@ async def handle_spending_alerts_callback(update, context):
     await query.edit_message_text("Alerts feature is coming soon!")
     await cancel_flow(query, context, silent=True)
 
-async def calculate_spending_for_period(message, context, start_date, end_date, period_name, detail_level="simple"):
+async def get_budget_for_category(session, category_name, month):
+    try:
+        # get_budgets returns a list, even if only one budget is found for a category and month
+        budgets = get_budgets(session, month=month, category=category_name.title())
+        if budgets:
+            # Assuming we only care about the first budget found for a given category and month
+            # Multiply by 100 to convert to cents, assuming get_amount() returns dollars or a pre-divided value
+            return budgets[0].get_amount() * 100
+        return 0 # No budget set for this category and month
+    except Exception as e:
+        print(f"Error fetching budget for category {category_name} in {month}: {e}")
+        return 0
+
+def get_budget_emoji(spent_amount, budgeted_amount):
+    if budgeted_amount == 0:
+        return "" # No budget, no emoji
+    if spent_amount <= budgeted_amount:
+        return "✅" # Within budget
+    else:
+        return "❌" # Over budget
+
+async def calculate_spending_for_period(message, context, start_date, end_date, period_name, detail_level="simple", num_months=1):
     try:
         with Actual(base_url=ACTUAL_API_URL, password=ACTUAL_PASSWORD, file=ACTUAL_BUDGET_ID, cert=False) as actual:
             transactions = get_transactions_in_range(actual.session, start_date, end_date)
-        loop = asyncio.get_running_loop()
-        categories_map = await loop.run_in_executor(None, get_categories_from_actual)
-        category_names_by_id = {v: k for k, v in categories_map.items()}
+            
+            loop = asyncio.get_running_loop()
+            categories_map = await loop.run_in_executor(None, get_categories_from_actual)
+            category_names_by_id = {v: k for k, v in categories_map.items()}
 
-        if not transactions:
-            await message.reply_text(f'No spending found for the {period_name}.')
-            return
+            if not transactions:
+                await message.reply_text(f'No spending found for the {period_name}.')
+                return
 
-        response_message = f'Spending for {period_name.capitalize()} ({start_date} to {end_date}):\n\n'
+            response_message = f'Spending for {period_name.capitalize()} ({start_date} to {end_date}):\n\n'
 
-        if detail_level == "simple":
-            spending_by_category = {}
-            for t in transactions:
-                if t.amount < 0: # Only consider expenses
-                    category_name = category_names_by_id.get(t.category.id, 'Uncategorized') if t.category else 'Uncategorized'
-                    spending_by_category[category_name] = spending_by_category.get(category_name, 0) + abs(t.amount)
+            if detail_level == "simple":
+                spending_by_category = {}
+                for t in transactions:
+                    if t.amount < 0: # Only consider expenses
+                        category_name = category_names_by_id.get(t.category.id, 'Uncategorized') if t.category else 'Uncategorized'
+                        spending_by_category[category_name] = spending_by_category.get(category_name, 0) + abs(t.amount)
 
-            for category, amount in sorted(spending_by_category.items()):
-                response_message += f'{category.capitalize()}: ${amount / 100:.2f}\n'
-        elif detail_level == "detailed":
-            for t in transactions:
-                if t.amount < 0: # Only consider expenses
-                    description = t.payee or t.notes or 'No description'
-                    amount = f"${abs(t.amount / 100):.2f}"
-                    category_name = category_names_by_id.get(t.category.id, 'Uncategorized') if t.category else 'Uncategorized'
-                    response_message += f'- {t.date}: {description} - {amount} ({category_name.capitalize()})\n'
-        else:
-            await message.reply_text("Invalid detail level. Please use 'simple' or 'detailed'.")
-            return
-        
-        await send_long_message_in_chunks(message, response_message)
+                # Fetch budgets for the current month (or relevant month for multi-month/day views)
+                # For 'days' and 'months' commands, we still use the monthly budget as a base
+                budget_month = date.today().replace(day=1) # Always use the current month's budget as a base
+
+                budget_data = {}
+                for category_name in spending_by_category.keys():
+                    budget_amount = await get_budget_for_category(actual.session, category_name, budget_month)
+                    budget_data[category_name] = budget_amount * num_months # Scale budget by number of months
+
+                for category, spent_amount in sorted(spending_by_category.items()):
+                    budgeted_amount = budget_data.get(category, 0)
+                    emoji = get_budget_emoji(spent_amount, budgeted_amount)
+                    response_message += f'{category.capitalize()}: Spent ${spent_amount / 100:.2f} / Budgeted ${budgeted_amount / 100:.2f} {emoji}\n'
+            elif detail_level == "detailed":
+                for t in transactions:
+                    if t.amount < 0: # Only consider expenses
+                        description = t.payee or t.notes or 'No description'
+                        amount = f"${abs(t.amount / 100):.2f}"
+                        category_name = category_names_by_id.get(t.category.id, 'Uncategorized') if t.category else 'Uncategorized'
+                        response_message += f'- {t.date}: {description} - {amount} ({category_name.capitalize()})\n'
+            else:
+                await message.reply_text("Invalid detail level. Please use 'simple' or 'detailed'.")
+                return
+            
+            await send_long_message_in_chunks(message, response_message)
 
     except (ConnectionError, ValueError) as e:
         await message.reply_text(f'API Error: {e}')
@@ -644,7 +676,7 @@ async def handle_months_input(update, context):
                 month -= 1
         
         start_date = date(year, month, 1)
-        await calculate_spending_for_period(update.message, context, start_date, today, f"last {months_back} months")
+        await calculate_spending_for_period(update.message, context, start_date, today, f"last {months_back} months", num_months=months_back)
         context.user_data.pop('awaiting_months_input', None)
         await cancel_flow(update, context, silent=True)
     except ValueError:
@@ -657,7 +689,7 @@ async def handle_spending_year_callback(update, context):
     await query.answer()
     today = date.today()
     start_date = today.replace(month=1, day=1)
-    await calculate_spending_for_period(query.message, context, start_date, today, "current year")
+    await calculate_spending_for_period(query.message, context, start_date, today, "current year", num_months=12)
     await cancel_flow(query, context, silent=True)
 
 async def handle_spending_years_callback(update, context):
@@ -675,7 +707,7 @@ async def handle_years_input(update, context):
         
         today = date.today()
         start_date = today.replace(year=today.year - years_back + 1, month=1, day=1)
-        await calculate_spending_for_period(update.message, context, start_date, today, f"last {years_back} years")
+        await calculate_spending_for_period(update.message, context, start_date, today, f"last {years_back} years", num_months=years_back * 12)
         context.user_data.pop('awaiting_years_input', None)
         await cancel_flow(update, context, silent=True)
     except ValueError:
