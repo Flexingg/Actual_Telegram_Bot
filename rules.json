@@ -1,0 +1,26 @@
+{
+    "rules": [
+        {
+            "conditions": [
+                {
+                    "field": "description",
+                    "op": "contains",
+                    "value": "401k",
+                    "type": "string",
+                    "options": null
+                }
+            ],
+            "operation": "and",
+            "actions": [
+                {
+                    "field": "category",
+                    "op": "set",
+                    "value": "37f484d9-47c3-4ce3-9825-49a56e7f6d93",
+                    "type": "id",
+                    "options": {}
+                }
+            ],
+            "stage": null
+        }
+    ]
+}

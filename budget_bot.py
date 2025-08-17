@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from actual import Actual
 from actual.queries import get_transactions, get_categories as get_categories_from_actual_queries, get_accounts, reconcile_transaction
 from actual.exceptions import UnknownFileId, ActualError
+from rules_manager import RuleSet, Rule, Condition, Action, ConditionType, ActionType, ValueType, load_rules, save_rules
 from sqlalchemy.orm.exc import MultipleResultsFound
 
 load_dotenv() # Load environment variables from .env file
@@ -26,6 +27,7 @@ ACTUAL_API_URL = os.environ.get('ACTUAL_API_URL')
 ACTUAL_BUDGET_ID = os.environ.get('ACTUAL_BUDGET_ID')
 ACTUAL_CASH_ACCOUNT_ID = os.environ.get('ACTUAL_CASH_ACCOUNT_ID')
 ACTUAL_PASSWORD = os.environ.get('ACTUAL_PASSWORD')
+PUBLIC_DOMAIN = os.environ.get('PUBLIC_DOMAIN')
 
 # --- Actual Budget API Functions ---
 
@@ -49,6 +51,11 @@ def get_categories_from_actual():
         categories_data = get_categories_from_actual_queries(actual.session)
         return {category.name.lower(): category.id for category in categories_data}
 
+def get_category_id_to_name_map():
+    with Actual(base_url=ACTUAL_API_URL, password=ACTUAL_PASSWORD, file=ACTUAL_BUDGET_ID, cert=False) as actual:
+        categories_data = get_categories_from_actual_queries(actual.session)
+        return {category.id: category.name for category in categories_data}
+
 def get_accounts_from_actual():
     with Actual(base_url=ACTUAL_API_URL, password=ACTUAL_PASSWORD, file=ACTUAL_BUDGET_ID, cert=False) as actual:
         accounts_data = get_accounts(actual.session)
@@ -71,7 +78,7 @@ def get_uncategorized_transactions(session):
     return uncategorized_transactions # Return Transaction objects directly
 
 def get_transactions_in_range(session, start_date, end_date):
-    transactions = get_transactions(session, date_start=start_date, date_end=end_date)
+    transactions = get_transactions(session, start_date=start_date, end_date=end_date)
     return transactions # Return Transaction objects directly
 
 
@@ -89,20 +96,40 @@ async def handle_message(update, context):
         await cancel_flow(update, context)
         return
 
-    if text.startswith("add "):
-        await add_expense(update, context)
-    elif text.startswith("sort"):
-        await sort_expense(update, context)
-    elif text.startswith("spending"):
-        await get_spending(update, context)
-    elif text.startswith("ai"):
-        await get_ai_suggestion(update, context)
-    elif text.startswith("categories"):
-        await get_categories(update)
-    elif text.startswith("sync"):
-        await sync_bank(update, context)
-    else:
-        await unrecognized_command(update, context)
+    if context.user_data.get('awaiting_days_input'):
+        await handle_days_input(update, context)
+        return
+    elif context.user_data.get('awaiting_months_input'):
+        await handle_months_input(update, context)
+        return
+    elif context.user_data.get('awaiting_years_input'):
+        await handle_years_input(update, context)
+        return
+    elif context.user_data.get('awaiting_rule_operation'):
+        await handle_rule_operation_input(update, context)
+        return
+    elif context.user_data.get('awaiting_condition_field'):
+        await handle_condition_field_input(update, context)
+        return
+    elif context.user_data.get('awaiting_condition_op'):
+        await handle_condition_op_input(update, context)
+        return
+    elif context.user_data.get('awaiting_condition_value'):
+        await handle_condition_value_input(update, context)
+        return
+    elif context.user_data.get('awaiting_action_field'):
+        await handle_action_field_input(update, context)
+        return
+    elif context.user_data.get('awaiting_action_op'):
+        await handle_action_op_input(update, context)
+        return
+    elif context.user_data.get('awaiting_action_value'):
+        await handle_action_value_input(update, context)
+        return
+
+    # The bot will now primarily rely on CommandHandler for these.
+    # This handler will catch messages that are not commands.
+    await unrecognized_command(update, context)
 
 async def get_categories(update):
     try:
@@ -165,14 +192,16 @@ async def sort_expense(update, context):
                 account_name = accounts_map.get(latest_transaction.account.id, 'Unknown Account')
                 description = re.sub(r"\s+", ' ', latest_transaction.notes).strip()
                 message_parts = [
-                    'Uncategorized Expense:',
+                    'Assign Category:',
                     f'Description: {description or "N/A"}',
                     f'Account: {account_name}',
                     f'Payee: {latest_transaction.payee.name or "N/A"}',
                     f'Amount: ${abs(latest_transaction.amount / 100):.2f}',
                     f'Date: {datetime.strptime(str(latest_transaction.date), "%Y%m%d").strftime("%A, %m/%d/%Y")}',
-                    f'Cleared: {latest_transaction.cleared}'
+                    f'Link: {PUBLIC_DOMAIN}/transactions/{latest_transaction.id}' if latest_transaction.id else 'N/A'
                 ]
+                if "amazon" in description.lower() or "amazon" in latest_transaction.payee.name.lower():
+                    message_parts.append("Amazon Link: https://www.amazon.com/your-orders ")
                 full_message = "\n".join(message_parts) + '\n\nPlease select a category for this expense:'
 
                 loop = asyncio.get_running_loop()
@@ -325,84 +354,43 @@ async def handle_sort_reply(update, context):
                 except Exception as e:
                     await update.message.reply_text(f'Error: {e}')
 
-async def cancel_flow(update, context):
+async def cancel_flow(update, context, silent=False):
     context.user_data['awaiting_category_for_sort'] = False
     context.user_data.pop('sorting_transaction', None)
     context.user_data.pop('sorting_in_progress', None)
     
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text("Sorting flow cancelled.")
-    else:
-        await update.message.reply_text("Sorting flow cancelled.")
+    # Clear rule creation state
+    context.user_data.pop('creating_rule', None)
+    context.user_data.pop('current_rule', None)
+    context.user_data.pop('awaiting_rule_operation', None)
+    context.user_data.pop('awaiting_condition_field', None)
+    context.user_data.pop('awaiting_condition_op', None)
+    context.user_data.pop('awaiting_condition_value', None)
+    context.user_data.pop('awaiting_action_field', None)
+    context.user_data.pop('awaiting_action_op', None)
+    context.user_data.pop('awaiting_action_value', None)
+
+    # Clear spending flow state
+    context.user_data.pop('awaiting_days_input', None)
+    context.user_data.pop('awaiting_months_input', None)
+    context.user_data.pop('awaiting_years_input', None)
+
+    if not silent:
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text("Flow cancelled.")
+        else:
+            await update.message.reply_text("Flow cancelled.")
 
 async def get_spending(update, context):
-    full_text = update.message.text.lower()
-    parts = full_text.split(' ')
-    
-    if len(parts) < 2:
-        await update.message.reply_text("Please specify a period (day/week/month/year) and optionally 'simple' or 'detailed'.\n"
-                                        "Example: spending month simple")
-        return
-
-    period = parts[1]
-    detail_level = parts[2] if len(parts) > 2 else "simple" # Default to simple
-
-    today = date.today()
-    start_date = None
-    end_date = today.strftime("%Y-%m-%d")
-
-    if period == "day":
-        start_date = today.strftime("%Y-%m-%d")
-    elif period == "week":
-        start_date = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
-    elif period == "month":
-        start_date = today.replace(day=1).strftime("%Y-%m-%d")
-    elif period == "year":
-        start_date = today.replace(month=1, day=1).strftime("%Y-%m-%d")
-    else:
-        await update.message.reply_text("Invalid period. Please use 'day', 'week', 'month', or 'year'.")
-        return
-
-    try:
-        transactions = get_transactions_in_range(start_date, end_date)
-        loop = asyncio.get_running_loop()
-        categories_map = await loop.run_in_executor(None, get_categories_from_actual)
-        # Invert categories_map to get category name from ID
-        category_names_by_id = {v: k for k, v in categories_map.items()}
-
-        if not transactions:
-            await update.message.reply_text(f'No spending found for the {period}.')
-            return
-
-        response_message = f'Spending for {period.capitalize()} ({start_date} to {end_date}):\n\n'
-
-        if detail_level == "simple":
-            spending_by_category = {}
-            for t in transactions:
-                if t.amount < 0: # Only consider expenses
-                    category_name = category_names_by_id.get(t.category, 'Uncategorized')
-                    spending_by_category[category_name] = spending_by_category.get(category_name, 0) + abs(t.amount)
-
-            for category, amount in sorted(spending_by_category.items()):
-                response_message += f'{category.capitalize()}: ${amount / 100:.2f}\n'
-        elif detail_level == "detailed":
-            for t in transactions:
-                if t.amount < 0: # Only consider expenses
-                    description = t.payee or t.notes or 'No description'
-                    amount = f"${abs(t.amount / 100):.2f}"
-                    category_name = category_names_by_id.get(t.category, 'Uncategorized')
-                    response_message += f'- {t.date}: {description} - {amount} ({category_name.capitalize()})\n'
-        else:
-            await update.message.reply_text("Invalid detail level. Please use 'simple' or 'detailed'.")
-            return
-        
-        await update.message.reply_text(response_message)
-
-    except (ConnectionError, ValueError) as e:
-        await update.message.reply_text(f'API Error: {e}')
-    except Exception as e:
-        await update.message.reply_text(f'Error: {e}')
+    keyboard = [
+        [InlineKeyboardButton("Spent", callback_data="spending_spent")],
+        [InlineKeyboardButton("Trajectory (Coming Soon)", callback_data="spending_trajectory")],
+        [InlineKeyboardButton("Alerts (Coming Soon)", callback_data="spending_alerts")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel_flow")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("What spending information would you like to see?", reply_markup=reply_markup)
 
 async def get_ai_suggestion(update, context):
     try:
@@ -499,33 +487,716 @@ async def sync_bank(update, context):
 
 async def unrecognized_command(update, context):
     print(f"Unrecognized command from user {update.effective_user.id}: {update.message.text}")
-    options_message = (
-        "Available commands:\n\n"
-        "\"Add\": `add [Payee] [Amount]` (e.g., `add Groceries 20`)\n"
-        "\"Sort\": `sort` (categorizes recent uncategorized expense)\n"
-        "\"Spending\": `spending [day/week/month/year] [simple/detailed]` (e.g., `spending month simple`)\n"
-        "\"AI\": `ai savings` (gets a savings suggestion)\n"
-        "\"Sync\": `sync` (runs bank synchronization)"
-    )
-    await update.message.reply_text(options_message)
+    await update.message.reply_text("Unrecognized command. Please use the menu button or type a valid command.")
 
+async def set_bot_commands(application):
+    commands = [
+        telegram.BotCommand("sort", "Sort uncategorized expenses"),
+        telegram.BotCommand("add", "Add a new expense (e.g., add Groceries 20)"),
+        telegram.BotCommand("spending", "View spending summary"),
+        telegram.BotCommand("ai", "Get AI savings suggestion"),
+        telegram.BotCommand("sync", "Synchronize bank accounts"),
+        telegram.BotCommand("rules", "Manage rules for transactions"),
+        telegram.BotCommand("readrules", "Get list of existing rules"),
+        telegram.BotCommand("createrule", "Walk through implementation of a new rule"),
+        telegram.BotCommand("runrules", "Runs all rules on all transactions")
+    ]
+    await application.bot.set_my_commands(commands)
+    print("Bot commands set successfully.")
+
+async def post_init_callback(application):
+    await set_bot_commands(application)
+
+async def send_long_message_in_chunks(message, text, chunk_size=4096):
+    """Sends a long message by splitting it into chunks."""
+    for i in range(0, len(text), chunk_size):
+        await message.reply_text(text[i:i + chunk_size])
+async def handle_spending_spent_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    keyboard = [
+        [InlineKeyboardButton("Day", callback_data="spending_day")],
+        [InlineKeyboardButton("Days", callback_data="spending_days")],
+        [InlineKeyboardButton("Month", callback_data="spending_month")],
+        [InlineKeyboardButton("Months", callback_data="spending_months")],
+        [InlineKeyboardButton("Year", callback_data="spending_year")],
+        [InlineKeyboardButton("Years", callback_data="spending_years")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel_flow")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("Select a spending period:", reply_markup=reply_markup)
+
+async def handle_spending_trajectory_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Trajectory feature is coming soon!")
+    await cancel_flow(query, context, silent=True)
+
+async def handle_spending_alerts_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Alerts feature is coming soon!")
+    await cancel_flow(query, context, silent=True)
+
+async def calculate_spending_for_period(message, context, start_date, end_date, period_name, detail_level="simple"):
+    try:
+        with Actual(base_url=ACTUAL_API_URL, password=ACTUAL_PASSWORD, file=ACTUAL_BUDGET_ID, cert=False) as actual:
+            transactions = get_transactions_in_range(actual.session, start_date, end_date)
+        loop = asyncio.get_running_loop()
+        categories_map = await loop.run_in_executor(None, get_categories_from_actual)
+        category_names_by_id = {v: k for k, v in categories_map.items()}
+
+        if not transactions:
+            await message.reply_text(f'No spending found for the {period_name}.')
+            return
+
+        response_message = f'Spending for {period_name.capitalize()} ({start_date} to {end_date}):\n\n'
+
+        if detail_level == "simple":
+            spending_by_category = {}
+            for t in transactions:
+                if t.amount < 0: # Only consider expenses
+                    category_name = category_names_by_id.get(t.category.id, 'Uncategorized') if t.category else 'Uncategorized'
+                    spending_by_category[category_name] = spending_by_category.get(category_name, 0) + abs(t.amount)
+
+            for category, amount in sorted(spending_by_category.items()):
+                response_message += f'{category.capitalize()}: ${amount / 100:.2f}\n'
+        elif detail_level == "detailed":
+            for t in transactions:
+                if t.amount < 0: # Only consider expenses
+                    description = t.payee or t.notes or 'No description'
+                    amount = f"${abs(t.amount / 100):.2f}"
+                    category_name = category_names_by_id.get(t.category.id, 'Uncategorized') if t.category else 'Uncategorized'
+                    response_message += f'- {t.date}: {description} - {amount} ({category_name.capitalize()})\n'
+        else:
+            await message.reply_text("Invalid detail level. Please use 'simple' or 'detailed'.")
+            return
+        
+        await send_long_message_in_chunks(message, response_message)
+
+    except (ConnectionError, ValueError) as e:
+        await message.reply_text(f'API Error: {e}')
+    except Exception as e:
+        await message.reply_text(f'Error: {e}')
+
+async def handle_spending_day_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    today = date.today()
+    await calculate_spending_for_period(query.message, context, today, today, "current day")
+    await cancel_flow(query, context, silent=True)
+
+async def handle_spending_days_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['awaiting_days_input'] = True
+    await query.edit_message_text("How many days back would you like to see spending for? (e.g., 7 for last 7 days)")
+
+async def handle_days_input(update, context):
+    try:
+        days_back = int(update.message.text)
+        if days_back <= 0:
+            await update.message.reply_text("Please enter a positive number of days.")
+            return
+        
+        today = date.today()
+        start_date = today - timedelta(days=days_back - 1)
+        await calculate_spending_for_period(update.message, context, start_date, today, f"last {days_back} days")
+        context.user_data.pop('awaiting_days_input', None)
+        await cancel_flow(update, context, silent=True)
+    except ValueError:
+        await update.message.reply_text("Invalid input. Please enter a number.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def handle_spending_month_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    today = date.today()
+    start_date = today.replace(day=1)
+    await calculate_spending_for_period(query.message, context, start_date, today, "current month")
+    await cancel_flow(query, context, silent=True)
+
+async def handle_spending_months_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['awaiting_months_input'] = True
+    await query.edit_message_text("How many months back would you like to see spending for? (e.g., 3 for last 3 months)")
+
+async def handle_months_input(update, context):
+    try:
+        months_back = int(update.message.text)
+        if months_back <= 0:
+            await update.message.reply_text("Please enter a positive number of months.")
+            return
+        
+        today = date.today()
+        # Calculate start date for X months back
+        year = today.year
+        month = today.month
+        
+        # Go back months_back - 1 full months, then set day to 1
+        for _ in range(months_back - 1):
+            if month == 1:
+                month = 12
+                year -= 1
+            else:
+                month -= 1
+        
+        start_date = date(year, month, 1)
+        await calculate_spending_for_period(update.message, context, start_date, today, f"last {months_back} months")
+        context.user_data.pop('awaiting_months_input', None)
+        await cancel_flow(update, context, silent=True)
+    except ValueError:
+        await update.message.reply_text("Invalid input. Please enter a number.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+async def handle_spending_year_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    today = date.today()
+    start_date = today.replace(month=1, day=1)
+    await calculate_spending_for_period(query.message, context, start_date, today, "current year")
+    await cancel_flow(query, context, silent=True)
+
+async def handle_spending_years_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['awaiting_years_input'] = True
+    await query.edit_message_text("How many years back would you like to see spending for? (e.g., 2 for last 2 years)")
+
+async def handle_years_input(update, context):
+    try:
+        years_back = int(update.message.text)
+        if years_back <= 0:
+            await update.message.reply_text("Please enter a positive number of years.")
+            return
+        
+        today = date.today()
+        start_date = today.replace(year=today.year - years_back + 1, month=1, day=1)
+        await calculate_spending_for_period(update.message, context, start_date, today, f"last {years_back} years")
+        context.user_data.pop('awaiting_years_input', None)
+        await cancel_flow(update, context, silent=True)
+    except ValueError:
+        await update.message.reply_text("Invalid input. Please enter a number.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
 def main():
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init_callback).build()
     print("Starting Budget Bot...")
+    
     application.add_handler(CommandHandler("start", start))
-    print("Added /start command handler")
     application.add_handler(CommandHandler("cancel", cancel_flow))
     application.add_handler(CommandHandler("stop", cancel_flow))
-    print("Added /cancel and /stop command handlers")
-    # Handler for inline keyboard callbacks for sorting
+    application.add_handler(CommandHandler("sort", sort_expense))
+    application.add_handler(CommandHandler("add", add_expense))
+    application.add_handler(CommandHandler("spending", get_spending))
+    application.add_handler(CommandHandler("ai", get_ai_suggestion))
+    application.add_handler(CommandHandler("sync", sync_bank))
+    application.add_handler(CommandHandler("categories", get_categories))
+    application.add_handler(CommandHandler("rules", rules_menu)) # New handler for the main rules command
+    application.add_handler(CommandHandler("readrules", read_rules))
+    application.add_handler(CommandHandler("createrule", create_rule_start))
+    application.add_handler(CommandHandler("runrules", run_rules))
+    print("Added command handlers for start, cancel, stop, sort, add, spending, ai, sync, categories, and rules commands.")
+
     application.add_handler(CallbackQueryHandler(handle_sort_reply, pattern=r'^sort_category_'))
-    # Handler for "Cancel" button in inline keyboard
     application.add_handler(CallbackQueryHandler(cancel_flow, pattern=r'^cancel_sort_flow$'))
     print("Added CallbackQueryHandler for sort categories and cancel button")
+    
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Added general message handler")
+    print("Added general message handler for unrecognized commands.")
+    
     application.run_polling()
     print("Bot is running...")
 
+# --- Rules Command Handlers (Placeholders) ---
+async def rules_menu(update, context):
+    await update.message.reply_text(
+        "Welcome to the Rules Management! Here are the available commands:\n"
+        "/readrules - Get a list of existing rules\n"
+        "/createrule - Walk through the implementation of a new rule\n"
+        "/runrules - Runs all rules on all transactions"
+    )
+
+async def read_rules(update, context):
+    await update.message.reply_text("Fetching existing rules...")
+    try:
+        loop = asyncio.get_running_loop()
+        category_id_to_name_map = await loop.run_in_executor(None, get_category_id_to_name_map)
+        print(f"DEBUG: In read_rules, category_id_to_name_map: {category_id_to_name_map}")
+        ruleset = load_rules(category_id_to_name_map)
+        if ruleset.rules:
+            response_message = "Existing Rules:\n\n"
+            for i, rule in enumerate(ruleset.rules):
+                response_message += f"Rule {i+1}:\n{rule}\n\n"
+            await update.message.reply_text(response_message)
+        else:
+            await update.message.reply_text("No rules found. Use /createrule to add a new rule.")
+    except Exception as e:
+        await update.message.reply_text(f"Error reading rules: {e}")
+
+async def create_rule_start(update, context):
+    await update.message.reply_text("Let's create a new rule! What kind of operation should the rule use for its conditions? (Type 'and' or 'or')")
+    context.user_data['creating_rule'] = True
+    context.user_data['current_rule'] = {'conditions': [], 'actions': []}
+    context.user_data['awaiting_rule_operation'] = True
+    
+    keyboard = [
+        [InlineKeyboardButton("AND (all conditions must match)", callback_data="rule_op_and")],
+        [InlineKeyboardButton("OR (any condition can match)", callback_data="rule_op_or")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel_rule_flow")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "Let's create a new rule! What kind of operation should the rule use for its conditions?",
+        reply_markup=reply_markup
+    )
+
+async def handle_rule_operation_input(update, context):
+    text = update.message.text.lower()
+    if text in ["and", "or"]:
+        context.user_data['current_rule']['operation'] = text
+        context.user_data['awaiting_rule_operation'] = False
+        await ask_for_condition_field(update, context)
+    else:
+        await update.message.reply_text("Invalid operation. Please type 'and' or 'or'.")
+
+async def handle_rule_operation_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    callback_data = query.data
+    if callback_data == "rule_op_and":
+        context.user_data['current_rule']['operation'] = "and"
+        context.user_data['awaiting_rule_operation'] = False
+        await query.edit_message_text("Rule operation set to AND. Now, let's add conditions.")
+        await ask_for_condition_field(query.message, context)
+    elif callback_data == "rule_op_or":
+        context.user_data['current_rule']['operation'] = "or"
+        context.user_data['awaiting_rule_operation'] = False
+        await query.edit_message_text("Rule operation set to OR. Now, let's add conditions.")
+        await ask_for_condition_field(query.message, context)
+    elif callback_data == "cancel_rule_flow":
+        await cancel_flow(query, context)
+
+async def ask_for_condition_field(update, context):
+    context.user_data['awaiting_condition_field'] = True
+    keyboard = [
+        [InlineKeyboardButton("Description", callback_data="condition_field_description")],
+        [InlineKeyboardButton("Notes", callback_data="condition_field_notes")],
+        [InlineKeyboardButton("Amount", callback_data="condition_field_amount")],
+        [InlineKeyboardButton("Category", callback_data="condition_field_category")],
+        [InlineKeyboardButton("Account", callback_data="condition_field_acct")],
+        [InlineKeyboardButton("Date", callback_data="condition_field_date")],
+        [InlineKeyboardButton("Imported Description", callback_data="condition_field_imported_description")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel_rule_flow")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.reply_text("What field do you want to set a condition on?", reply_markup=reply_markup)
+
+async def handle_condition_field_input(update, context):
+    field = update.message.text.lower()
+    valid_fields = [f.value for f in Condition.__fields__.get('field').type.__args__] # Accessing Literal values
+    if field in valid_fields:
+        context.user_data['current_condition_field'] = field
+        context.user_data['awaiting_condition_field'] = False
+        await ask_for_condition_op(update, context)
+    else:
+        await update.message.reply_text(f"Invalid field. Please choose from: {', '.join(valid_fields)}")
+
+async def handle_condition_field_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    field = query.data.replace("condition_field_", "")
+    context.user_data['current_condition_field'] = field
+    context.user_data['awaiting_condition_field'] = False
+    await query.edit_message_text(f"Condition field set to '{field}'. Now, choose an operation.")
+    await ask_for_condition_op(query.message, context)
+
+async def ask_for_condition_op(update, context):
+    context.user_data['awaiting_condition_op'] = True
+    field_type = ValueType.from_field(context.user_data['current_condition_field'])
+    
+    keyboard = []
+    row = []
+    for i, op_type in enumerate(ConditionType):
+        if field_type.is_valid(op_type):
+            button = InlineKeyboardButton(op_type.value.replace("_", " ").title(), callback_data=f"condition_op_{op_type.value}")
+            row.append(button)
+            if (i + 1) % 3 == 0: # 3 buttons per row
+                keyboard.append(row)
+                row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel_rule_flow")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.reply_text("What operation do you want to use?", reply_markup=reply_markup)
+
+async def handle_condition_op_input(update, context):
+    op_str = update.message.text.lower().replace(" ", "")
+    try:
+        op = ConditionType(op_str)
+        field_type = ValueType.from_field(context.user_data['current_condition_field'])
+        if field_type.is_valid(op):
+            context.user_data['current_condition_op'] = op
+            context.user_data['awaiting_condition_op'] = False
+            await ask_for_condition_value(update, context)
+        else:
+            await update.message.reply_text(f"Operation '{op_str}' is not valid for field type '{field_type.name}'. Please choose a valid operation.")
+    except ValueError:
+        await update.message.reply_text("Invalid operation. Please choose a valid operation from the list.")
+
+async def handle_condition_op_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    op_str = query.data.replace("condition_op_", "")
+    op = ConditionType(op_str)
+    context.user_data['current_condition_op'] = op
+    context.user_data['awaiting_condition_op'] = False
+    await query.edit_message_text(f"Condition operation set to '{op_str}'. Now, enter the value.")
+    await ask_for_condition_value(query.message, context)
+
+async def ask_for_condition_value(update, context):
+    context.user_data['awaiting_condition_value'] = True
+    await update.reply_text("Please enter the value for the condition:")
+
+async def handle_condition_value_input(update, context):
+    value_str = update.message.text
+    field = context.user_data['current_condition_field']
+    op = context.user_data['current_condition_op']
+    
+    try:
+        value_type = ValueType.from_field(field)
+        # Attempt to convert value based on type
+        if value_type == ValueType.NUMBER:
+            value = int(float(value_str) * 100) # Convert to cents
+        elif value_type == ValueType.BOOLEAN:
+            value = value_str.lower() == 'true'
+        elif value_type == ValueType.DATE:
+            value = date.fromisoformat(value_str)
+        else:
+            value = value_str
+
+        new_condition = Condition(field=field, op=op, value=value)
+        context.user_data['current_rule']['conditions'].append(new_condition.model_dump(mode="json"))
+        context.user_data['awaiting_condition_value'] = False
+        await add_another_condition(update, context)
+
+    except ValueError as e:
+        await update.message.reply_text(f"Invalid value for type '{value_type.name}': {e}. Please try again.")
+    except Exception as e:
+        await update.message.reply_text(f"Error processing value: {e}. Please try again.")
+
+async def add_another_condition(update, context):
+    keyboard = [
+        [InlineKeyboardButton("Add another condition", callback_data="add_another_condition")],
+        [InlineKeyboardButton("Continue to actions", callback_data="continue_to_actions")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel_rule_flow")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Condition added. What's next?", reply_markup=reply_markup)
+
+async def handle_add_another_condition_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    callback_data = query.data
+    if callback_data == "add_another_condition":
+        await query.edit_message_text("Adding another condition.")
+        await ask_for_condition_field(query.message, context)
+    elif callback_data == "continue_to_actions":
+        await query.edit_message_text("Continuing to actions.")
+        await ask_for_action_field(query.message, context)
+    elif callback_data == "cancel_rule_flow":
+        await cancel_flow(query, context)
+
+async def ask_for_action_field(update, context):
+    context.user_data['awaiting_action_field'] = True
+    keyboard = [
+        [InlineKeyboardButton("Category", callback_data="action_field_category")],
+        [InlineKeyboardButton("Description", callback_data="action_field_description")],
+        [InlineKeyboardButton("Notes", callback_data="action_field_notes")],
+        [InlineKeyboardButton("Cleared", callback_data="action_field_cleared")],
+        [InlineKeyboardButton("Account", callback_data="action_field_acct")],
+        [InlineKeyboardButton("Date", callback_data="action_field_date")],
+        [InlineKeyboardButton("Amount", callback_data="action_field_amount")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel_rule_flow")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.reply_text("What field do you want to apply an action to?", reply_markup=reply_markup)
+
+async def handle_action_field_input(update, context):
+    field = update.message.text.lower()
+    valid_fields = [f.value for f in Action.__fields__.get('field').type.__args__[0].__args__] # Accessing Literal values
+    if field in valid_fields:
+        context.user_data['current_action_field'] = field
+        context.user_data['awaiting_action_field'] = False
+        await ask_for_action_op(update, context)
+    else:
+        await update.message.reply_text(f"Invalid field. Please choose from: {', '.join(valid_fields)}")
+
+async def handle_action_field_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    field = query.data.replace("action_field_", "")
+    context.user_data['current_action_field'] = field
+    context.user_data['awaiting_action_field'] = False
+    await query.edit_message_text(f"Action field set to '{field}'. Now, choose an operation.")
+    await ask_for_action_op(query.message, context)
+
+async def ask_for_action_op(update, context):
+    context.user_data['awaiting_action_op'] = True
+    keyboard = []
+    row = []
+    for i, op_type in enumerate(ActionType):
+        button = InlineKeyboardButton(op_type.value.replace("_", " ").title(), callback_data=f"action_op_{op_type.value}")
+        row.append(button)
+        if (i + 1) % 3 == 0: # 3 buttons per row
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel_rule_flow")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.reply_text("What action operation do you want to use?", reply_markup=reply_markup)
+
+async def handle_action_op_input(update, context):
+    op_str = update.message.text.lower().replace(" ", "")
+    try:
+        op = ActionType(op_str)
+        context.user_data['current_action_op'] = op
+        context.user_data['awaiting_action_op'] = False
+        await ask_for_action_value(update, context)
+    except ValueError:
+        await update.message.reply_text("Invalid action operation. Please choose a valid operation.")
+
+async def handle_action_op_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    op_str = query.data.replace("action_op_", "")
+    op = ActionType(op_str)
+    context.user_data['current_action_op'] = op
+    context.user_data['awaiting_action_op'] = False
+    await query.edit_message_text(f"Action operation set to '{op_str}'. Now, enter the value.")
+    await ask_for_action_value(query.message, context)
+
+async def ask_for_action_value(update, context):
+    context.user_data['awaiting_action_value'] = True
+    await update.reply_text("Please enter the value for the action:")
+
+async def handle_action_value_input(update, context):
+    value_str = update.message.text
+    field = context.user_data['current_action_field']
+    op = context.user_data['current_action_op']
+
+    try:
+        # Determine value type based on field for Action
+        if field == 'category' or field == 'description' or field == 'acct':
+            # For category, description (payee), and account, we need to get the ID
+            # This will require fetching categories/accounts from Actual
+            loop = asyncio.get_running_loop()
+            if field == 'category':
+                categories = await loop.run_in_executor(None, get_categories_from_actual)
+                value = categories.get(value_str.lower())
+                if not value:
+                    await update.message.reply_text(f"Category '{value_str}' not found. Please enter a valid category name.")
+                    return
+            elif field == 'acct':
+                accounts = await loop.run_in_executor(None, get_accounts_from_actual)
+                # Assuming accounts_map is {id: name}, we need to find id by name
+                account_id = next((aid for aid, aname in accounts.items() if aname.lower() == value_str.lower()), None)
+                value = account_id
+                if not value:
+                    await update.message.reply_text(f"Account '{value_str}' not found. Please enter a valid account name.")
+                    return
+            else: # description (payee)
+                # For payee, we might need a way to get payee ID from name, or just use the name directly if actualpy handles it.
+                # For now, let's assume direct string value for description field in action.
+                value = value_str
+        elif field == 'amount':
+            value = int(float(value_str) * 100) # Convert to cents
+        elif field == 'cleared':
+            value = value_str.lower() == 'true'
+        elif field == 'date':
+            value = date.fromisoformat(value_str)
+        else: # notes, or other string fields
+            value = value_str
+
+        new_action = Action(field=field, op=op, value=value)
+        context.user_data['current_rule']['actions'].append(new_action.model_dump(mode="json"))
+        context.user_data['awaiting_action_value'] = False
+        await add_another_action(update, context)
+
+    except ValueError as e:
+        await update.message.reply_text(f"Invalid value for action: {e}. Please try again.")
+    except Exception as e:
+        await update.message.reply_text(f"Error processing action value: {e}. Please try again.")
+
+async def add_another_action(update, context):
+    keyboard = [
+        [InlineKeyboardButton("Add another action", callback_data="add_another_action")],
+        [InlineKeyboardButton("Finish rule creation", callback_data="finish_rule_creation")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel_rule_flow")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Action added. What's next?", reply_markup=reply_markup)
+
+async def handle_add_another_action_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    callback_data = query.data
+    if callback_data == "add_another_action":
+        await query.edit_message_text("Adding another action.")
+        await ask_for_action_field(query.message, context)
+    elif callback_data == "finish_rule_creation":
+        await query.edit_message_text("Finishing rule creation.")
+        await finish_rule_creation(query.message, context)
+    elif callback_data == "cancel_rule_flow":
+        await cancel_flow(query, context)
+
+async def finish_rule_creation(update, context):
+    try:
+        rule_data = context.user_data['current_rule']
+        new_rule = Rule(**rule_data)
+        
+        ruleset = load_rules()
+        ruleset.add(new_rule)
+        save_rules(ruleset)
+
+        await update.reply_text("Rule created and saved successfully!")
+        context.user_data.pop('creating_rule', None)
+        context.user_data.pop('current_rule', None)
+    except Exception as e:
+        await update.reply_text(f"Error finishing rule creation: {e}")
+        # Optionally, clear partial rule data on error
+        context.user_data.pop('creating_rule', None)
+        context.user_data.pop('current_rule', None)
+
+async def run_rules(update, context):
+    await update.message.reply_text("Running all rules on all transactions...")
+    try:
+        ruleset = load_rules()
+        if not ruleset.rules:
+            await update.message.reply_text("No rules defined to run. Use /createrule to add rules.")
+            return
+
+        with Actual(base_url=ACTUAL_API_URL, password=ACTUAL_PASSWORD, file=ACTUAL_BUDGET_ID, cert=False) as actual:
+            all_transactions = get_transactions(actual.session)
+            
+            transactions_affected_count = 0
+            for transaction in all_transactions:
+                # Create a temporary object to pass to rule.run that mimics the transaction structure
+                # This is a workaround because the Rule.run in rules_manager.py is simplified
+                # and doesn't directly interact with SQLAlchemy objects.
+                # In a real scenario, Rule.run would be part of actualpy or designed to work with its objects.
+                temp_transaction_data = {
+                    "id": transaction.id,
+                    "date": transaction.get_date(),
+                    "amount": transaction.get_amount(),
+                    "payee": transaction.payee.name if transaction.payee else None,
+                    "notes": transaction.notes,
+                    "category": transaction.category,
+                    "account": transaction.account.id,
+                    "cleared": bool(transaction.cleared),
+                    "imported_description": transaction.imported_description
+                }
+                
+                # Store original values to check for changes
+                original_notes = temp_transaction_data["notes"]
+                original_category = temp_transaction_data["category"]
+                original_amount = temp_transaction_data["amount"]
+                original_cleared = temp_transaction_data["cleared"]
+
+                rule_applied = False
+                for rule in ruleset.rules:
+                    # Pass a mutable dictionary that rule.run can modify
+                    if rule.run(temp_transaction_data):
+                        rule_applied = True
+                
+                if rule_applied:
+                    # Apply changes back to the actual SQLAlchemy transaction object
+                    # This is a simplified update. A more robust solution would use reconcile_transaction
+                    # or similar Actual.py methods for proper updates and change tracking.
+                    
+                    # Check if notes changed
+                    if temp_transaction_data["notes"] != original_notes:
+                        transaction.notes = temp_transaction_data["notes"]
+                    
+                    # Check if category changed
+                    if temp_transaction_data["category"] != original_category:
+                        transaction.category = temp_transaction_data["category"]
+                    
+                    # Check if amount changed (only if ActionType.SET was used for amount)
+                    if temp_transaction_data["amount"] != original_amount:
+                        transaction.amount = temp_transaction_data["amount"]
+
+                    # Check if cleared status changed
+                    if temp_transaction_data["cleared"] != original_cleared:
+                        transaction.cleared = temp_transaction_data["cleared"]
+
+                    # For other fields, you would add similar checks and updates.
+                    # For now, we'll assume direct attribute assignment is sufficient for simple cases.
+                    
+                    transactions_affected_count += 1
+            
+            if transactions_affected_count > 0:
+                actual.commit() # Commit all changes made by rules
+                await update.message.reply_text(f"Successfully ran rules. {transactions_affected_count} transactions were affected.")
+            else:
+                await update.message.reply_text("Rules ran, but no transactions were affected.")
+
+    except Exception as e:
+        await update.message.reply_text(f"Error running rules: {e}")
+
 if __name__ == '__main__':
-    main()
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init_callback).build()
+    print("Starting Budget Bot...")
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("cancel", cancel_flow))
+    application.add_handler(CommandHandler("stop", cancel_flow))
+    application.add_handler(CommandHandler("sort", sort_expense))
+    application.add_handler(CommandHandler("add", add_expense))
+    application.add_handler(CommandHandler("spending", get_spending))
+    application.add_handler(CommandHandler("ai", get_ai_suggestion))
+    application.add_handler(CommandHandler("sync", sync_bank))
+    application.add_handler(CommandHandler("categories", get_categories))
+    application.add_handler(CommandHandler("rules", rules_menu)) # New handler for the main rules command
+    application.add_handler(CommandHandler("readrules", read_rules))
+    application.add_handler(CommandHandler("createrule", create_rule_start))
+    application.add_handler(CommandHandler("runrules", run_rules))
+    print("Added command handlers for start, cancel, stop, sort, add, spending, ai, sync, categories, and rules commands.")
+
+    application.add_handler(CallbackQueryHandler(handle_sort_reply, pattern=r'^sort_category_'))
+    application.add_handler(CallbackQueryHandler(cancel_flow, pattern=r'^cancel_sort_flow$'))
+    
+    # New CallbackQueryHandlers for rule creation
+    application.add_handler(CallbackQueryHandler(handle_rule_operation_callback, pattern=r'^rule_op_'))
+    application.add_handler(CallbackQueryHandler(handle_condition_field_callback, pattern=r'^condition_field_'))
+    application.add_handler(CallbackQueryHandler(handle_condition_op_callback, pattern=r'^condition_op_'))
+    application.add_handler(CallbackQueryHandler(handle_add_another_condition_callback, pattern=r'^(add_another_condition|continue_to_actions|cancel_rule_flow)$'))
+    application.add_handler(CallbackQueryHandler(handle_action_field_callback, pattern=r'^action_field_'))
+    application.add_handler(CallbackQueryHandler(handle_action_op_callback, pattern=r'^action_op_'))
+    application.add_handler(CallbackQueryHandler(handle_add_another_action_callback, pattern=r'^(add_another_action|finish_rule_creation|cancel_rule_flow)$'))
+    application.add_handler(CallbackQueryHandler(cancel_flow, pattern=r'^cancel_rule_flow$'))
+
+    # New CallbackQueryHandlers for spending flow
+    application.add_handler(CallbackQueryHandler(handle_spending_spent_callback, pattern=r'^spending_spent$'))
+    application.add_handler(CallbackQueryHandler(handle_spending_trajectory_callback, pattern=r'^spending_trajectory$'))
+    application.add_handler(CallbackQueryHandler(handle_spending_alerts_callback, pattern=r'^spending_alerts$'))
+    application.add_handler(CallbackQueryHandler(handle_spending_day_callback, pattern=r'^spending_day$'))
+    application.add_handler(CallbackQueryHandler(handle_spending_days_callback, pattern=r'^spending_days$'))
+    application.add_handler(CallbackQueryHandler(handle_spending_month_callback, pattern=r'^spending_month$'))
+    application.add_handler(CallbackQueryHandler(handle_spending_months_callback, pattern=r'^spending_months$'))
+    application.add_handler(CallbackQueryHandler(handle_spending_year_callback, pattern=r'^spending_year$'))
+    application.add_handler(CallbackQueryHandler(handle_spending_years_callback, pattern=r'^spending_years$'))
+
+    # New MessageHandlers for spending flow inputs (handled in handle_message)
+
+    print("Added CallbackQueryHandler for sort categories, cancel button, and rule creation flow.")
+    
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("Added general message handler for unrecognized commands.")
+    
+    application.run_polling()
+    print("Bot is running...")
