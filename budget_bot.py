@@ -27,6 +27,8 @@ ACTUAL_BUDGET_ID = os.environ.get('ACTUAL_BUDGET_ID')
 ACTUAL_CASH_ACCOUNT_ID = os.environ.get('ACTUAL_CASH_ACCOUNT_ID')
 ACTUAL_PASSWORD = os.environ.get('ACTUAL_PASSWORD')
 PUBLIC_DOMAIN = os.environ.get('PUBLIC_DOMAIN')
+TELEGRAM_CHAT_ID_RAW = os.environ.get('TELEGRAM_CHAT_ID')
+TELEGRAM_CHAT_IDS = [chat_id.strip() for chat_id in TELEGRAM_CHAT_ID_RAW.split(' ')] if TELEGRAM_CHAT_ID_RAW else []
 
 # --- Actual Budget API Functions ---
 
@@ -63,18 +65,16 @@ def get_accounts_from_actual():
             accounts_map[str(account.id)] = account.name
         return accounts_map
 
-def get_uncategorized_transactions(session):
-    print("Fetching uncategorized transactions...")
-    print("Actual instance initialized, fetching transactions...")
-    # Fetch all transactions and then filter for uncategorized ones
+def get_uncategorized_transactions(session, start_date=None):
+    print(f"Fetching uncategorized transactions from {start_date.strftime('%Y-%m-%d') if start_date else 'all time'}...")
     try:
-        all_transactions = get_transactions(session) # Fetch all transactions
+        all_transactions = get_transactions(session, start_date=start_date)
         uncategorized_transactions = [t for t in all_transactions if t.category is None]
     except Exception as e:
         print(f"Error fetching transactions: {e}")
         raise ConnectionError(f"Error fetching transactions: {e}")
     print(f"Found {len(uncategorized_transactions)} uncategorized transactions.")
-    return uncategorized_transactions # Return Transaction objects directly
+    return uncategorized_transactions
 
 def get_transactions_in_range(session, start_date, end_date):
     transactions = get_transactions(session, start_date=start_date, end_date=end_date)
@@ -276,7 +276,23 @@ async def handle_sort_reply(update, context):
                                 update_existing=True
                             )
                             actual.commit()
-                            await query.edit_message_text(f'Expense categorized as {category_name_title_case}.')
+                            
+                            # Get transaction date and month for budget comparison
+                            transaction_date = datetime.strptime(str(transaction_to_update.get_date()), "%Y-%m-%d").date()
+                            transaction_month = transaction_date.replace(day=1) # First day of the month
+                            
+                            # Get spent and budget for the assigned category and month
+                            spent_amount = await get_spent_for_category_and_month(actual.session, category_name_lower, transaction_month)
+                            budgeted_amount = await get_budget_for_category(actual.session, category_name_lower, transaction_month)
+                            emoji = get_budget_emoji(spent_amount, budgeted_amount)
+
+                            month_name = transaction_date.strftime("%B")
+                            response_text = (
+                                f'Expense categorized as {category_name_title_case}.\n'
+                                f'{month_name} {category_name_title_case}: '
+                                f'${spent_amount / 100:.2f}/${budgeted_amount / 100:.2f} {emoji}'
+                            )
+                            await query.edit_message_text(response_text)
                             context.user_data.pop('sorting_transaction', None)
                             if context.user_data.get('sorting_in_progress'):
                                 await sort_expense(query.message, context) # Pass query.message to sort_expense
@@ -337,7 +353,23 @@ async def handle_sort_reply(update, context):
                                     update_existing=True
                                 )
                                 actual.commit()
-                                await update.message.reply_text(f'Expense categorized as {category_name_title_case}.')
+                                
+                                # Get transaction date and month for budget comparison
+                                transaction_date = datetime.strptime(str(transaction_to_update.get_date()), "%Y-%m-%d").date()
+                                transaction_month = transaction_date.replace(day=1) # First day of the month
+
+                                # Get spent and budget for the assigned category and month
+                                spent_amount = await get_spent_for_category_and_month(actual.session, category_name_lower, transaction_month)
+                                budgeted_amount = await get_budget_for_category(actual.session, category_name_lower, transaction_month)
+                                emoji = get_budget_emoji(spent_amount, budgeted_amount)
+
+                                month_name = transaction_date.strftime("%B")
+                                response_text = (
+                                    f'Expense categorized as {category_name_title_case}.\n'
+                                    f'{month_name} {category_name_title_case}: '
+                                    f'${spent_amount / 100:.2f}/${budgeted_amount / 100:.2f} {emoji}'
+                                )
+                                await update.message.reply_text(response_text)
                                 context.user_data.pop('sorting_transaction', None)
                                 if context.user_data.get('sorting_in_progress'):
                                     await sort_expense(update, context) # This is a text message, so update.message is fine
@@ -422,7 +454,6 @@ async def get_ai_suggestion(update, context):
         for t in formatted_transactions:
             t['category_name'] = category_names_by_id.get(t.pop('category_id'), 'Uncategorized')
         
-
         transactions_json = json.dumps(formatted_transactions, indent=2)
 
         # Construct prompt for Gemini API
@@ -448,17 +479,21 @@ async def get_ai_suggestion(update, context):
     except Exception as e:
         await update.message.reply_text(f'Error: {e}')
 
-async def sync_bank(update, context):
-    try:
+async def sync_bank_logic():
+    """
+    Performs the bank synchronization logic.
+    Returns a tuple: (success_message, error_message)
+    """
+    all_synchronized_transactions = []
+    response_message_parts = []
+    error_message = None
 
+    try:
         with Actual(base_url=ACTUAL_API_URL, password=ACTUAL_PASSWORD, file=ACTUAL_BUDGET_ID, cert=False) as actual:
             accounts_map = get_accounts_from_actual()
-            all_synchronized_transactions = []
-            response_message_parts = []
 
             for account_id, account_name in accounts_map.items():
                 try:
-                    # Call run_bank_sync for each individual account
                     synchronized_transactions = actual.run_bank_sync(account=account_id)
                     if synchronized_transactions:
                         response_message_parts.append(f"Synchronized transactions for {account_name}:\n")
@@ -471,22 +506,82 @@ async def sync_bank(update, context):
                     response_message_parts.append(f"Error syncing {account_name}: {account_e}")
             
             if all_synchronized_transactions:
-                actual.commit() # sync changes back to the server
-                await update.message.reply_text("\n".join(response_message_parts))
+                actual.commit()
+                success_message = "\n".join(response_message_parts)
             else:
-                await update.message.reply_text("No new transactions to synchronize across all accounts.")
+                success_message = "No new transactions to synchronize across all accounts."
+            
+            return success_message, None # No error
+
     except MultipleResultsFound as e:
-        response_message_parts.append(f"Error syncing {account_name}: {e}. This usually means there are duplicate accounts or ambiguous data in your Actual Budget server for this account. Please check your Actual Budget UI for '{account_name}'.")
+        error_message = f"Error syncing: {e}. This usually means there are duplicate accounts or ambiguous data in your Actual Budget server. Please check your Actual Budget UI."
     except UnknownFileId as e:
-        response_message_parts.append(f"Error syncing {account_name}: {e}. This might indicate an issue with your ACTUAL_BUDGET_ID or multiple budgets with the same name. Please check your Actual Budget server configuration.")
+        error_message = f"Error syncing: {e}. This might indicate an issue with your ACTUAL_BUDGET_ID or multiple budgets with the same name. Please check your Actual Budget server configuration."
     except ActualError as e:
-        response_message_parts.append(f"Error syncing {account_name}: {e}. Please check your Actual Budget server and SimpleFIN configuration for this account.")
+        error_message = f"Error syncing: {e}. Please check your Actual Budget server and SimpleFIN configuration."
     except Exception as e:
-        response_message_parts.append(f"An unexpected error occurred while syncing {account_name}: {e}")
+        error_message = f"An unexpected error occurred while syncing: {e}"
+    
+    return None, error_message
+
+async def sync_command_handler(update, context):
+    """Handles the /sync command from a user."""
+    await update.message.reply_text("Starting bank synchronization...")
+    success_message, error_message = await sync_bank_logic()
+    if success_message:
+        await update.message.reply_text(success_message)
+    elif error_message:
+        await update.message.reply_text(f"Synchronization failed: {error_message}")
+    else:
+        await update.message.reply_text("Synchronization completed with an unknown result.")
 
 async def unrecognized_command(update, context):
     print(f"Unrecognized command from user {update.effective_user.id}: {update.message.text}")
     await update.message.reply_text("Unrecognized command. Please use the menu button or type a valid command.")
+
+async def send_notification(application, chat_ids, message):
+    for chat_id in chat_ids:
+        try:
+            await application.bot.send_message(chat_id=chat_id, text=message)
+            print(f"Notification sent to chat ID {chat_id}: {message}")
+        except Exception as e:
+            print(f"Error sending notification to chat ID {chat_id}: {e}")
+
+async def scheduled_sync_and_notify(application):
+    while True:
+        print("Running scheduled sync and notification...")
+        try:
+            sync_success_message, sync_error_message = await sync_bank_logic()
+
+            if sync_error_message:
+                print(f"Scheduled sync failed: {sync_error_message}")
+                if TELEGRAM_CHAT_IDS:
+                    await send_notification(application, TELEGRAM_CHAT_IDS, f"Scheduled bank sync failed: {sync_error_message}")
+            else:
+                print(f"Scheduled sync completed: {sync_success_message}")
+                today = date.today()
+                thirty_days_ago = today - timedelta(days=30)
+                
+                with Actual(base_url=ACTUAL_API_URL, password=ACTUAL_PASSWORD, file=ACTUAL_BUDGET_ID, cert=False) as actual:
+                    uncategorized_count = len(get_uncategorized_transactions(actual.session, start_date=thirty_days_ago))
+                
+                if uncategorized_count > 0:
+                    notification_message = f"Sync complete! Found {uncategorized_count} new uncategorized transactions in the last 30 days. Use /sort to categorize them."
+                else:
+                    notification_message = "Sync complete! No new uncategorized transactions found in the last 30 days."
+
+                budget_comparison_message = await get_monthly_budget_comparison_message()
+                notification_message += f"\n{budget_comparison_message}"
+
+                if TELEGRAM_CHAT_IDS:
+                    await send_notification(application, TELEGRAM_CHAT_IDS, notification_message)
+                else:
+                    print("TELEGRAM_CHAT_IDS not set. Cannot send notification.")
+
+        except Exception as e:
+            print(f"Error in scheduled sync and notification: {e}")
+        
+        await asyncio.sleep(24 * 60 * 60) # Wait for 24 hours
 
 async def set_bot_commands(application):
     commands = [
@@ -505,6 +600,7 @@ async def set_bot_commands(application):
 
 async def post_init_callback(application):
     await set_bot_commands(application)
+    asyncio.create_task(scheduled_sync_and_notify(application))
 
 async def send_long_message_in_chunks(message, text, chunk_size=4096):
     """Sends a long message by splitting it into chunks."""
@@ -548,6 +644,34 @@ async def get_budget_for_category(session, category_name, month):
         return 0 # No budget set for this category and month
     except Exception as e:
         print(f"Error fetching budget for category {category_name} in {month}: {e}")
+        return 0
+
+async def get_spent_for_category_and_month(session, category_name_lower, month_date):
+    """
+    Calculates the total spent for a given category in a specific month.
+    month_date should be the first day of the month (e.g., date(2023, 6, 1)).
+    """
+    try:
+        # Get all transactions for the specified month
+        # Need to determine the end date of the month
+        next_month = month_date.replace(day=28) + timedelta(days=4) # Advance to next month
+        end_of_month = next_month - timedelta(days=next_month.day) # Go back to last day of previous month
+
+        transactions = get_transactions_in_range(session, month_date, end_of_month)
+        
+        loop = asyncio.get_running_loop()
+        categories_map = await loop.run_in_executor(None, get_categories_from_actual)
+        category_names_by_id = {v: k for k, v in categories_map.items()}
+
+        total_spent = 0
+        for t in transactions:
+            if t.amount < 0: # Only consider expenses
+                category_of_transaction = category_names_by_id.get(t.category.id, 'Uncategorized') if t.category else 'Uncategorized'
+                if category_of_transaction.lower() == category_name_lower:
+                    total_spent += abs(t.amount)
+        return total_spent
+    except Exception as e:
+        print(f"Error calculating spent for category {category_name_lower} in {month_date}: {e}")
         return 0
 
 def get_budget_emoji(spent_amount, budgeted_amount):
@@ -610,6 +734,75 @@ async def calculate_spending_for_period(message, context, start_date, end_date, 
         await message.reply_text(f'API Error: {e}')
     except Exception as e:
         await message.reply_text(f'Error: {e}')
+
+async def get_monthly_budget_comparison_message():
+    today = date.today()
+    start_of_month = today.replace(day=1)
+    current_day_of_month = today.day
+    days_in_month = (date(today.year, today.month % 12 + 1, 1) - timedelta(days=1)).day
+
+    try:
+        with Actual(base_url=ACTUAL_API_URL, password=ACTUAL_PASSWORD, file=ACTUAL_BUDGET_ID, cert=False) as actual:
+            transactions = get_transactions_in_range(actual.session, start_of_month, today)
+            
+            loop = asyncio.get_running_loop()
+            categories_map = await loop.run_in_executor(None, get_categories_from_actual)
+            category_names_by_id = {v: k for k, v in categories_map.items()}
+
+            spending_by_category = {}
+            for t in transactions:
+                if t.amount < 0: # Only consider expenses
+                    category_name = category_names_by_id.get(t.category.id, 'Uncategorized') if t.category else 'Uncategorized'
+                    spending_by_category[category_name] = spending_by_category.get(category_name, 0) + abs(t.amount)
+
+            budget_month = start_of_month
+            budget_comparison_data = []
+
+            for category, spent_amount in spending_by_category.items():
+                budgeted_amount = await get_budget_for_category(actual.session, category, budget_month)
+                
+                percent_spent = 0
+                if budgeted_amount > 0:
+                    percent_spent = (spent_amount / budgeted_amount) * 100
+                elif spent_amount > 0: # Spent money but no budget
+                    percent_spent = 1000000 # Effectively infinite over budget
+
+                budget_comparison_data.append({
+                    "category": category,
+                    "spent": spent_amount,
+                    "budget": budgeted_amount,
+                    "percent_spent": percent_spent
+                })
+            
+            # Sort by percent_spent (highest percent spent to lowest)
+            budget_comparison_data.sort(key=lambda x: x['percent_spent'], reverse=True)
+
+            message_parts = ["\n--- Monthly Budget Comparison ---"]
+            if not budget_comparison_data:
+                message_parts.append("No spending data for the current month.")
+            else:
+                for item in budget_comparison_data:
+                    category = item['category'].capitalize()
+                    spent = item['spent'] / 100
+                    budget = item['budget'] / 100
+                    percent_spent = item['percent_spent']
+
+                    status_emoji = ""
+                    if percent_spent > 100:
+                        status_emoji = "❌" # Over budget
+                    elif percent_spent <= 100:
+                        status_emoji = "✅" # Within budget
+
+                    message_parts.append(
+                        f"{category}: Spent ${spent:.2f} | Budget ${budget:.2f} | "
+                        f"{percent_spent:.2f}% of budget {status_emoji}"
+                    )
+            return "\n".join(message_parts)
+
+    except (ConnectionError, ValueError) as e:
+        return f"API Error fetching budget comparison: {e}"
+    except Exception as e:
+        return f"Error generating budget comparison: {e}"
 
 async def handle_spending_day_callback(update, context):
     query = update.callback_query
@@ -714,34 +907,6 @@ async def handle_years_input(update, context):
         await update.message.reply_text("Invalid input. Please enter a number.")
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
-def main():
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init_callback).build()
-    print("Starting Budget Bot...")
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("cancel", cancel_flow))
-    application.add_handler(CommandHandler("stop", cancel_flow))
-    application.add_handler(CommandHandler("sort", sort_expense))
-    application.add_handler(CommandHandler("add", add_expense))
-    application.add_handler(CommandHandler("spending", get_spending))
-    application.add_handler(CommandHandler("ai", get_ai_suggestion))
-    application.add_handler(CommandHandler("sync", sync_bank))
-    application.add_handler(CommandHandler("categories", get_categories))
-    application.add_handler(CommandHandler("rules", rules_menu)) # New handler for the main rules command
-    application.add_handler(CommandHandler("readrules", read_rules))
-    application.add_handler(CommandHandler("createrule", create_rule_start))
-    application.add_handler(CommandHandler("runrules", run_rules))
-    print("Added command handlers for start, cancel, stop, sort, add, spending, ai, sync, categories, and rules commands.")
-
-    application.add_handler(CallbackQueryHandler(handle_sort_reply, pattern=r'^sort_category_'))
-    application.add_handler(CallbackQueryHandler(cancel_flow, pattern=r'^cancel_sort_flow$'))
-    print("Added CallbackQueryHandler for sort categories and cancel button")
-    
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Added general message handler for unrecognized commands.")
-    
-    application.run_polling()
-    print("Bot is running...")
 
 # --- Rules Command Handlers (Placeholders) ---
 async def rules_menu(update, context):
@@ -1191,7 +1356,7 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler("add", add_expense))
     application.add_handler(CommandHandler("spending", get_spending))
     application.add_handler(CommandHandler("ai", get_ai_suggestion))
-    application.add_handler(CommandHandler("sync", sync_bank))
+    application.add_handler(CommandHandler("sync", sync_command_handler))
     application.add_handler(CommandHandler("categories", get_categories))
     application.add_handler(CommandHandler("rules", rules_menu)) # New handler for the main rules command
     application.add_handler(CommandHandler("readrules", read_rules))
@@ -1230,5 +1395,6 @@ if __name__ == '__main__':
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Added general message handler for unrecognized commands.")
     
+
     application.run_polling()
     print("Bot is running...")
