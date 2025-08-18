@@ -13,8 +13,10 @@ from actual.queries import get_transactions, get_categories as get_categories_fr
 from actual.exceptions import UnknownFileId, ActualError
 from rules_manager import RuleSet, Rule, Condition, Action, ConditionType, ActionType, ValueType, load_rules, save_rules
 from sqlalchemy.orm.exc import MultipleResultsFound
+from pathlib import Path
 
-load_dotenv() # Load environment variables from .env file
+dotenv_path = Path('./stack.env') 
+load_dotenv(dotenv_path=dotenv_path) # Load environment variables from stack.env file
 
 # --- Gemini API Configuration ---
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')

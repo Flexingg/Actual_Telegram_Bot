@@ -3,5 +3,5 @@ services:
     build: .
     container_name: budget_bot_container
     env_file:
-      - .env
+      - stack.env
     restart: unless-stopped
