@@ -139,7 +139,12 @@ async def handle_message(update, context):
  
 async def process_gemini_message(update, context, tool_response: Optional[str] = None, tool_function_name: Optional[str] = None):
     user_message = update.message.text
-    await update.message.reply_text("Thinking... 🧠")
+    # Store message IDs in a list for deletion
+    if 'messages_to_delete' not in context.user_data:
+        context.user_data['messages_to_delete'] = []
+    
+    thinking_message = await update.message.reply_text("Thinking... 🧠")
+    context.user_data['messages_to_delete'].append(thinking_message.message_id)
  
     try:
         gemini_response = gemini_client.send_message(user_message, tool_response, tool_function_name)
@@ -149,7 +154,8 @@ async def process_gemini_message(update, context, tool_response: Optional[str] =
             tool_name = gemini_response.name
             # Convert tool_args from MapComposite to a standard dictionary for easier manipulation
             tool_args_dict = dict(gemini_response.args)
-            await update.message.reply_text(f"Gemini requested to call tool: `{tool_name}` with arguments: `{tool_args_dict}`")
+            tool_request_message = await update.message.reply_text(f"Gemini requested to call tool: `{tool_name}` with arguments: `{tool_args_dict}`")
+            context.user_data['messages_to_delete'].append(tool_request_message.message_id)
  
             # Execute the tool call
             if hasattr(data_fetcher, tool_name):
@@ -165,20 +171,56 @@ async def process_gemini_message(update, context, tool_response: Optional[str] =
                     tool_args_dict['num_months'] = int(tool_args_dict['num_months'])
 
                 tool_output = await tool_function(**tool_args_dict)
-                await update.message.reply_text(f"Tool `{tool_name}` executed. Result:\n`{tool_output[:500]}...`") # Show a snippet
+                # Delete all messages in the messages_to_delete list
+                for msg_id in context.user_data.get('messages_to_delete', []):
+                    try:
+                        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg_id)
+                    except Exception as delete_e:
+                        print(f"Error deleting message {msg_id}: {delete_e}")
+                context.user_data['messages_to_delete'] = [] # Clear the list after deletion
+
                 
                 # Send the tool output back to Gemini
                 await process_gemini_message(update, context, tool_output, tool_function_name=tool_name)
             else:
+                # If tool execution fails, delete previous messages and send error
+                for msg_id in context.user_data.get('messages_to_delete', []):
+                    try:
+                        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg_id)
+                    except Exception as delete_e:
+                        print(f"Error deleting message {msg_id}: {delete_e}")
+                context.user_data['messages_to_delete'] = []
                 await update.message.reply_text(f"Error: Gemini requested an unknown tool: `{tool_name}`")
         elif isinstance(gemini_response, list):
             # Gemini provided a text response
+            # Delete all messages in the messages_to_delete list
+            for msg_id in context.user_data.get('messages_to_delete', []):
+                try:
+                    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg_id)
+                except Exception as delete_e:
+                    print(f"Error deleting message {msg_id}: {delete_e}")
+            context.user_data['messages_to_delete'] = []
+
             for response_chunk in gemini_response:
                 await update.message.reply_text(response_chunk)
         else:
+            # If no valid response, delete previous messages and send error
+            for msg_id in context.user_data.get('messages_to_delete', []):
+                try:
+                    await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg_id)
+                except Exception as delete_e:
+                    print(f"Error deleting message {msg_id}: {delete_e}")
+            context.user_data['messages_to_delete'] = []
             await update.message.reply_text("Could not get a valid response from AI. Please try again later.")
- 
+
     except Exception as e:
+        # On any error, attempt to delete previous messages and send error
+        for msg_id in context.user_data.get('messages_to_delete', []):
+            try:
+                await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg_id)
+            except Exception as delete_e:
+                print(f"Error deleting message {msg_id}: {delete_e}")
+        context.user_data['messages_to_delete'] = []
         await update.message.reply_text(f"Error interacting with AI: {e}")
         print(f"Error in process_gemini_message: {e}")
 
