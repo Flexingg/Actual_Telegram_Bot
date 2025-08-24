@@ -6,6 +6,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Messa
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 import json
 import os
+from typing import Optional
 from datetime import date, timedelta, datetime
 from dotenv import load_dotenv
 from actual import Actual
@@ -15,7 +16,7 @@ from rules_manager import RuleSet, Rule, Condition, Action, ConditionType, Actio
 from sqlalchemy.orm.exc import MultipleResultsFound
 from pathlib import Path
 
-from gemini_client import GeminiClient
+from gemini_client import GeminiClient, FunctionCall
 from data_fetcher import DataFetcher
 
 dotenv_path = Path('./stack.env')
@@ -32,9 +33,9 @@ TELEGRAM_CHAT_ID_RAW = os.environ.get('TELEGRAM_CHAT_ID')
 TELEGRAM_CHAT_IDS = [chat_id.strip() for chat_id in TELEGRAM_CHAT_ID_RAW.split(' ')] if TELEGRAM_CHAT_ID_RAW else []
 
 # --- Initialize Clients ---
-gemini_client = GeminiClient()
 data_fetcher = DataFetcher()
-
+gemini_client = GeminiClient(data_fetcher) # Pass data_fetcher to GeminiClient
+ 
 # --- Actual Budget API Functions ---
 
 def add_transaction(date, amount, payee, notes, category_id):
@@ -95,11 +96,12 @@ async def handle_message(update, context):
     print(f"Received message from user {update.effective_user.id}: {update.message.text}")
     text = update.message.text.lower()
     print(f"Received message: {text}")
-
+ 
     if text == "cancel" or text == "stop":
         await cancel_flow(update, context)
         return
-
+ 
+    # Existing flow checks
     if context.user_data.get('awaiting_days_input'):
         await handle_days_input(update, context)
         return
@@ -130,16 +132,55 @@ async def handle_message(update, context):
     elif context.user_data.get('awaiting_action_value'):
         await handle_action_value_input(update, context)
         return
-    elif context.user_data.get('awaiting_ai_months') and context.user_data.get('ai_custom_months_input'):
-        await handle_ai_months_input(update, context)
-        return
-    elif context.user_data.get('awaiting_ai_question'):
-        await handle_ai_question_input(update, context)
-        return
+    # The previous AI flow handlers are now replaced by the tool-calling mechanism
+    
+    # If no other flow is active, send the message to Gemini for tool-calling or direct response
+    await process_gemini_message(update, context)
+ 
+async def process_gemini_message(update, context, tool_response: Optional[str] = None, tool_function_name: Optional[str] = None):
+    user_message = update.message.text
+    await update.message.reply_text("Thinking... 🧠")
+ 
+    try:
+        gemini_response = gemini_client.send_message(user_message, tool_response, tool_function_name)
+ 
+        if isinstance(gemini_response, FunctionCall):
+            # Gemini wants to call a tool
+            tool_name = gemini_response.name
+            # Convert tool_args from MapComposite to a standard dictionary for easier manipulation
+            tool_args_dict = dict(gemini_response.args)
+            await update.message.reply_text(f"Gemini requested to call tool: `{tool_name}` with arguments: `{tool_args_dict}`")
+ 
+            # Execute the tool call
+            if hasattr(data_fetcher, tool_name):
+                print(f"Executing tool: {tool_name} with args {tool_args_dict}")
+                tool_function = getattr(data_fetcher, tool_name)
+                # Ensure arguments are passed correctly, especially for lists
+                # Gemini might send a single string for a list if it's a single item
+                if 'categories' in tool_args_dict and isinstance(tool_args_dict['categories'], str):
+                    tool_args_dict['categories'] = [tool_args_dict['categories']]
+                    print("Converted 'categories' argument to list:", tool_args_dict['categories'])
+                # Explicitly cast num_months to int if present, as Gemini might send it as a float
+                if tool_name == 'get_financial_data' and 'num_months' in tool_args_dict:
+                    tool_args_dict['num_months'] = int(tool_args_dict['num_months'])
 
-    # The bot will now primarily rely on CommandHandler for these.
-    # This handler will catch messages that are not commands.
-    await unrecognized_command(update, context)
+                tool_output = await tool_function(**tool_args_dict)
+                await update.message.reply_text(f"Tool `{tool_name}` executed. Result:\n`{tool_output[:500]}...`") # Show a snippet
+                
+                # Send the tool output back to Gemini
+                await process_gemini_message(update, context, tool_output, tool_function_name=tool_name)
+            else:
+                await update.message.reply_text(f"Error: Gemini requested an unknown tool: `{tool_name}`")
+        elif isinstance(gemini_response, list):
+            # Gemini provided a text response
+            for response_chunk in gemini_response:
+                await update.message.reply_text(response_chunk)
+        else:
+            await update.message.reply_text("Could not get a valid response from AI. Please try again later.")
+ 
+    except Exception as e:
+        await update.message.reply_text(f"Error interacting with AI: {e}")
+        print(f"Error in process_gemini_message: {e}")
 
 async def get_categories(update):
     try:
@@ -483,156 +524,6 @@ async def get_spending(update, context):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("What spending information would you like to see?", reply_markup=reply_markup)
 
-async def ai_command(update, context):
-    """Initiates the AI financial analysis flow."""
-    context.user_data['ai_selected_categories'] = []
-    await update.message.reply_text("Please select categories for AI analysis (you can select multiple, or 'All'):",
-                                    reply_markup=await get_category_selection_keyboard(context))
-    context.user_data['awaiting_ai_categories'] = True
-
-async def handle_ai_category_selection(update, context):
-    query = update.callback_query
-    await query.answer()
-    callback_data = query.data
-
-    if callback_data == "ai_category_all":
-        loop = asyncio.get_running_loop()
-        categories_dict = await loop.run_in_executor(None, get_categories_from_actual)
-        context.user_data['ai_selected_categories'] = list(categories_dict.keys())
-        await query.edit_message_text("All categories selected. Now, how many months back?",
-                                      reply_markup=await get_months_back_keyboard())
-        context.user_data['awaiting_ai_categories'] = False
-        context.user_data['awaiting_ai_months'] = True
-    elif callback_data == "ai_category_done": # Handle 'Done' button first
-        if not context.user_data['ai_selected_categories']:
-            error_message_text = "Please select at least one category, or 'All Categories'."
-            if query.message.text != error_message_text:
-                await query.edit_message_text(error_message_text)
-            return
-        
-        # Show a "processing" state with a timer emoji
-        await query.edit_message_text("Processing categories... ⏳")
-        await asyncio.sleep(0.5) # Add a small delay to allow the message to update
-
-        new_message_text = (f"Categories selected: {', '.join([c.title() for c in context.user_data['ai_selected_categories']])}.\n"
-                            f"Now, how many months back?")
-        new_reply_markup = await get_months_back_keyboard()
-        
-        # Always edit the message after the "processing" state to show the next step
-        await query.edit_message_text(new_message_text, reply_markup=new_reply_markup)
-        
-        context.user_data['awaiting_ai_categories'] = False
-        context.user_data['awaiting_ai_months'] = True
-    elif callback_data.startswith("ai_category_"): # Handle individual category selection last
-        category_name = callback_data.replace("ai_category_", "")
-        if category_name not in context.user_data['ai_selected_categories']:
-            context.user_data['ai_selected_categories'].append(category_name)
-        else:
-            context.user_data['ai_selected_categories'].remove(category_name)
-        
-        new_reply_markup = await get_category_selection_keyboard(context)
-        current_reply_markup = query.message.reply_markup
-
-        # Compare the new reply_markup with the current one to avoid BadRequest error
-        if json.dumps(new_reply_markup.to_dict()) != json.dumps(current_reply_markup.to_dict()):
-            await query.edit_message_text(f"Please select categories for AI analysis (you can select multiple, or 'All'):",
-                                          reply_markup=new_reply_markup)
-    elif callback_data == "cancel_flow":
-        await cancel_flow(query, context)
-
-async def handle_ai_months_selection(update, context):
-    query = update.callback_query
-    await query.answer()
-    callback_data = query.data
-
-    if callback_data.startswith("ai_months_"):
-        months_str = callback_data.replace("ai_months_", "")
-        if months_str == "custom":
-            await query.edit_message_text("Please enter the number of months back for AI analysis:")
-            context.user_data['awaiting_ai_months'] = True # Keep this true to catch the next message
-            context.user_data['ai_custom_months_input'] = True
-        else:
-            num_months = int(months_str)
-            context.user_data['ai_num_months'] = num_months
-            await query.edit_message_text(f"Months back set to {num_months}. Now, please type your question for the AI:")
-            context.user_data['awaiting_ai_months'] = False
-            context.user_data['awaiting_ai_question'] = True
-    elif callback_data == "cancel_flow":
-        await cancel_flow(query, context)
-
-async def handle_ai_months_input(update, context):
-    try:
-        num_months = int(update.message.text)
-        if num_months <= 0:
-            await update.message.reply_text("Please provide a positive number of months.")
-            return
-        context.user_data['ai_num_months'] = num_months
-        await update.message.reply_text(f"Months back set to {num_months}. Now, please type your question for the AI:")
-        context.user_data['awaiting_ai_months'] = False
-        context.user_data.pop('ai_custom_months_input', None)
-        context.user_data['awaiting_ai_question'] = True
-    except ValueError:
-        await update.message.reply_text("Invalid input for number of months. Please use a number.")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
-async def handle_ai_question_input(update, context):
-    user_question = update.message.text
-    categories = context.user_data.get('ai_selected_categories', [])
-    num_months = context.user_data.get('ai_num_months')
-
-    if not categories or num_months is None:
-        await update.message.reply_text("Error: Categories or number of months not set. Please restart with /ai.")
-        await cancel_flow(update, context, silent=True)
-        return
-
-    await update.message.reply_text(f"Analyzing for categories: {', '.join([c.title() for c in categories])} for the last {num_months} months with AI. Please wait...")
-
-    today = date.today()
-    year = today.year
-    month = today.month
-    
-    for _ in range(num_months - 1):
-        if month == 1:
-            month = 12
-            year -= 1
-        else:
-            month -= 1
-    
-    start_date = date(year, month, 1)
-    
-    all_transactions = data_fetcher.get_transactions_in_range(start_date, today)
-
-    formatted_financial_data = data_fetcher.format_financial_data_for_gemini(
-        all_transactions, categories, num_months
-    )
-
-    full_prompt_raw = (
-        f"The user asked: '{user_question}'\n\n"
-        "Here is the relevant financial data:\n"
-        f"{formatted_financial_data}\n\n"
-        "Please analyze this data and answer the user's question. "
-        "Provide a concise and actionable answer based on the provided data. "
-        "Please respond in plain text without any special formatting. No markdown formatting."
-        "Repsond to the user in a chatbot friendly way, but straightforward and concise."
-    )
-    full_prompt = re.sub(r"\s+", ' ', full_prompt_raw).strip()
-
-    gemini_responses = gemini_client.send_prompt(full_prompt)
-
-    if gemini_responses:
-        for response_chunk in gemini_responses:
-            await update.message.reply_text(response_chunk)
-    else:
-        await update.message.reply_text("Could not get a response from AI. Please try again later.")
-
-    # Clear AI flow state
-    context.user_data.pop('awaiting_ai_categories', None)
-    context.user_data.pop('ai_selected_categories', None)
-    context.user_data.pop('awaiting_ai_months', None)
-    context.user_data.pop('ai_num_months', None)
-    context.user_data.pop('awaiting_ai_question', None)
-    context.user_data.pop('ai_custom_months_input', None)
 
 async def sync_bank_logic():
     """
@@ -706,6 +597,11 @@ async def scheduled_sync_and_notify(application):
     while True:
         print("Running scheduled sync and notification...")
         try:
+            # Refresh data cache
+            print("Refreshing data cache...")
+            await data_fetcher.refresh_cache_async()
+            print("Data cache refresh complete.")
+
             sync_success_message, sync_error_message = await sync_bank_logic()
 
             if sync_error_message:
@@ -755,6 +651,11 @@ async def set_bot_commands(application):
 
 async def post_init_callback(application, args):
     await set_bot_commands(application)
+    # Initial cache refresh
+    print("Performing initial data cache refresh...")
+    await data_fetcher.refresh_cache_sync()
+    print("Initial data cache refresh complete.")
+
     if not args.no_sync:
         asyncio.create_task(scheduled_sync_and_notify(application))
     else:
@@ -1517,15 +1418,16 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler("sort", sort_expense))
     application.add_handler(CommandHandler("add", add_expense))
     application.add_handler(CommandHandler("spending", get_spending))
-    application.add_handler(CommandHandler("ai", ai_command)) # New handler for AI analysis
+    # Remove the old AI command handler
+    # application.add_handler(CommandHandler("ai", ai_command))
     application.add_handler(CommandHandler("sync", sync_command_handler))
     application.add_handler(CommandHandler("categories", get_categories))
     application.add_handler(CommandHandler("rules", rules_menu)) # New handler for the main rules command
     application.add_handler(CommandHandler("readrules", read_rules))
     application.add_handler(CommandHandler("createrule", create_rule_start))
     application.add_handler(CommandHandler("runrules", run_rules))
-    print("Added command handlers for start, cancel, stop, sort, add, spending, ai, sync, categories, and rules commands.")
-
+    print("Added command handlers for start, cancel, stop, sort, add, spending, sync, categories, and rules commands.")
+ 
     application.add_handler(CallbackQueryHandler(handle_sort_reply, pattern=r'^sort_category_'))
     application.add_handler(CallbackQueryHandler(cancel_flow, pattern=r'^cancel_sort_flow$'))
     
@@ -1538,7 +1440,7 @@ if __name__ == '__main__':
     application.add_handler(CallbackQueryHandler(handle_action_op_callback, pattern=r'^action_op_'))
     application.add_handler(CallbackQueryHandler(handle_add_another_action_callback, pattern=r'^(add_another_action|finish_rule_creation|cancel_rule_flow)$'))
     application.add_handler(CallbackQueryHandler(cancel_flow, pattern=r'^cancel_rule_flow$'))
-
+ 
     # New CallbackQueryHandlers for spending flow
     application.add_handler(CallbackQueryHandler(handle_spending_spent_callback, pattern=r'^spending_spent$'))
     application.add_handler(CallbackQueryHandler(handle_spending_trajectory_callback, pattern=r'^spending_trajectory$'))
@@ -1549,16 +1451,16 @@ if __name__ == '__main__':
     application.add_handler(CallbackQueryHandler(handle_spending_months_callback, pattern=r'^spending_months$'))
     application.add_handler(CallbackQueryHandler(handle_spending_year_callback, pattern=r'^spending_year$'))
     application.add_handler(CallbackQueryHandler(handle_spending_years_callback, pattern=r'^spending_years$'))
-
-    # New CallbackQueryHandlers for AI flow
-    application.add_handler(CallbackQueryHandler(handle_ai_category_selection, pattern=r'^ai_category_'))
-    application.add_handler(CallbackQueryHandler(handle_ai_months_selection, pattern=r'^ai_months_'))
-
-    print("Added CallbackQueryHandler for sort categories, cancel button, rule creation flow, spending flow, and AI flow.")
+ 
+    # Remove the old AI flow callback handlers
+    # application.add_handler(CallbackQueryHandler(handle_ai_category_selection, pattern=r'^ai_category_'))
+    # application.add_handler(CallbackQueryHandler(handle_ai_months_selection, pattern=r'^ai_months_'))
+ 
+    print("Added CallbackQueryHandler for sort categories, cancel button, rule creation flow, and spending flow.")
     
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Added general message handler for unrecognized commands.")
+    print("Added general message handler for non-command messages to be processed by Gemini.")
     
-
+ 
     application.run_polling()
     print("Bot is running...")
